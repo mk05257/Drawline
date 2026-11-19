@@ -5,14 +5,30 @@ import {nextDraw,drawDate,countdownParts} from './schedule.mjs';
 import {describe,checkLine,newestDrawMatches,recentDraws} from './history.mjs';
 import {readSaved,writeSaved,exportSavedLines,mergeImportedLines} from './storage.mjs';
 import {loadHistory} from './history-storage.mjs';
+import {GOOGLE_OAUTH_CLIENT_ID} from './drive-config.mjs';
+import {
+ getAccessToken,
+ setAccessToken,
+ clearAccessToken,
+ readDeletedIds,
+ writeDeletedIds,
+ createPkceRequest,
+ exchangeCodeForToken,
+ handleOAuthRedirectIfPresent,
+ syncSavedLines,
+ UnauthorizedDriveError,
+ PKCE_SESSION_KEY,
+ AUTH_CHANNEL_NAME
+} from './drive-sync.mjs';
 import './style.css';
 
 const pad=n=>String(n).padStart(2,'0');
+const fmtSyncTime=d=>`${pad(d.getHours())}:${pad(d.getMinutes())}`;
 const MONTHS=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 const UNIT_LABELS={DAYS:'DAYS',H:'HOURS',MIN:'MIN',S:'SEC'};
 const savedDate=d=>new Date(d).toLocaleDateString('en-CA',{year:'numeric',month:'short',day:'numeric'});
 const shortDrawDate=d=>new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'short',day:'numeric'}).format(new Date(d+'T12:00:00Z'));
-const renderStatItems=items=>items.map((text,i)=><React.Fragment key={text}>{i>0&&', '}<span className="stat-item">{text}</span></React.Fragment>);
+const renderStatItems=items=>items.map(text=><span className="stat-item" key={text}>{text}</span>);
 
 function fmtArchiveDate(iso){
  if(!iso)return '';
@@ -192,7 +208,10 @@ function History({saved,history,error,initialGame}){
       <div className="numcircle">{gameStats.gaps[0].number}</div>
       <div className="freq-body">
        <div className="t">Longest gap now</div>
-       <div className="s">Draws since last drawn · {renderStatItems(gameStats.gaps.map(n=>`#${n.number} (${n.gap})`))}</div>
+       <div className="s">
+        <span className="s-lead">Draws since last drawn</span>
+        <div className="stat-list">{renderStatItems(gameStats.gaps.map(n=>`#${n.number} (${n.gap})`))}</div>
+       </div>
       </div>
       <div className="count">{gameStats.gaps[0].gap}</div>
      </div>
@@ -200,7 +219,10 @@ function History({saved,history,error,initialGame}){
       <div className="numcircle pair">{gameStats.pairs[0][0]}</div>
       <div className="freq-body">
        <div className="t">Most common pair</div>
-       <div className="s">Drawn together · {renderStatItems(gameStats.pairs.map(([p,n])=>`${p} (${n})`))}</div>
+       <div className="s">
+        <span className="s-lead">Drawn together</span>
+        <div className="stat-list">{renderStatItems(gameStats.pairs.map(([p,n])=>`${p} (${n})`))}</div>
+       </div>
       </div>
       <div className="count">{gameStats.pairs[0][1]}</div>
      </div>
@@ -256,18 +278,111 @@ function App(){
  const [count,setCount]=useState(2);
  const [lines,setLines]=useState([]);
  const [saved,setSaved]=useState([]);
+ const [deletedIds,setDeletedIds]=useState([]);
  const [storageError,setStorageError]=useState('');
  const [importNotice,setImportNotice]=useState('');
  const [error,setError]=useState('');
  const [now,setNow]=useState(new Date());
+ const [syncState,setSyncState]=useState(GOOGLE_OAUTH_CLIENT_ID?'signed_out':'unconfigured');
+ const [lastSyncedAt,setLastSyncedAt]=useState(null);
+ const [syncMessage,setSyncMessage]=useState('');
  const fileInputRef=useRef(null);
+ const driveFileIdRef=useRef(null);
+ const savedRef=useRef([]);
+ const deletedRef=useRef([]);
+
+ async function runDriveSync(nextLines=savedRef.current,nextDeleted=deletedRef.current){
+  if(!GOOGLE_OAUTH_CLIENT_ID){
+   setSyncState('unconfigured');
+   return;
+  }
+  const token=getAccessToken();
+  if(!token){
+   setSyncState('signed_out');
+   return;
+  }
+  if(typeof navigator!=='undefined'&&navigator.onLine===false){
+   setSyncState('offline');
+   setSyncMessage('');
+   return;
+  }
+  setSyncState('syncing');
+  setSyncMessage('');
+  try{
+   const res=await syncSavedLines({
+    localLines:nextLines,
+    localDeletedIds:nextDeleted,
+    token,
+    online:typeof navigator==='undefined'?true:navigator.onLine!==false,
+    knownFileId:driveFileIdRef.current
+   });
+   if(res.fileId)driveFileIdRef.current=res.fileId;
+   if(res.status==='offline'){
+    setSyncState('offline');
+    return;
+   }
+   try{
+    writeSaved(localStorage,res.lines);
+    writeDeletedIds(localStorage,res.deletedIds);
+   }catch{
+    /* localStorage write failure should not discard synced state in memory */
+   }
+   savedRef.current=res.lines;
+   deletedRef.current=res.deletedIds;
+   setSaved(res.lines);
+   setDeletedIds(res.deletedIds);
+   setLastSyncedAt(new Date());
+   setSyncState('synced');
+   setSyncMessage('');
+  }catch(err){
+   if(err instanceof UnauthorizedDriveError||err?.status===401){
+    clearAccessToken();
+    setSyncState('reauth');
+    setSyncMessage('Sign in again');
+   }else{
+    setSyncState('error');
+    setSyncMessage(err.message||'Could not sync with Google Drive.');
+   }
+  }
+ }
 
  useEffect(()=>{
-  try{setSaved(readSaved(localStorage));}catch(e){setStorageError(e.message||'Local storage unavailable.');}
+  let initialLines=[];
+  let initialDeleted=[];
+  try{
+   initialLines=readSaved(localStorage);
+   initialDeleted=readDeletedIds(localStorage);
+   savedRef.current=initialLines;
+   deletedRef.current=initialDeleted;
+   setSaved(initialLines);
+   setDeletedIds(initialDeleted);
+  }catch(e){
+   setStorageError(e.message||'Local storage unavailable.');
+  }
   const tick=setInterval(()=>setNow(new Date()),1000);
   const route=()=>setPage(location.hash==='#history'?'history':'picker');
+  const onOnline=()=>{if(getAccessToken())runDriveSync();};
+  const onOffline=()=>{if(getAccessToken())setSyncState('offline');};
   addEventListener('hashchange',route);
-  return ()=>{clearInterval(tick);removeEventListener('hashchange',route);};
+  addEventListener('online',onOnline);
+  addEventListener('offline',onOffline);
+
+  handleOAuthRedirectIfPresent().then(res=>{
+   if(!res||res.handledInPopup)return;
+   if(res.ok){
+    runDriveSync(savedRef.current,deletedRef.current);
+   }else if(res.error){
+    setSyncState('error');
+    setSyncMessage(res.error);
+   }
+  });
+
+  return ()=>{
+   clearInterval(tick);
+   removeEventListener('hashchange',route);
+   removeEventListener('online',onOnline);
+   removeEventListener('offline',onOffline);
+  };
  },[]);
 
  const draw=nextDraw(game,now);
@@ -276,19 +391,111 @@ function App(){
  const recentMatches=useMemo(()=>newestDrawMatches(saved,history),[saved,history]);
  const historyCount=history?.[game]?.rows?.length;
 
- function persist(next){
+ function persist(nextLines,nextDeleted=deletedRef.current){
   try{
-   writeSaved(localStorage,next);
-   setSaved(next);
+   writeSaved(localStorage,nextLines);
+   writeDeletedIds(localStorage,nextDeleted);
+   savedRef.current=nextLines;
+   deletedRef.current=nextDeleted;
+   setSaved(nextLines);
+   setDeletedIds(nextDeleted);
    setStorageError('');
   }catch{
    setStorageError('Could not save changes. Browser storage may be full or unavailable.');
+   return;
+  }
+  if(getAccessToken()){
+   runDriveSync(nextLines,nextDeleted);
   }
  }
 
  function save(line){
   setImportNotice('');
-  persist([{...line,id:crypto.randomUUID(),savedAt:new Date().toISOString()},...saved]);
+  persist([{...line,id:crypto.randomUUID(),savedAt:new Date().toISOString()},...saved],deletedIds);
+ }
+
+ async function handleGoogleSignIn(){
+  if(!GOOGLE_OAUTH_CLIENT_ID){
+   setSyncState('unconfigured');
+   return;
+  }
+  setSyncMessage('');
+  let pkce;
+  try{
+   pkce=await createPkceRequest({clientId:GOOGLE_OAUTH_CLIENT_ID});
+   try{
+    sessionStorage.setItem(PKCE_SESSION_KEY,JSON.stringify({codeVerifier:pkce.codeVerifier,state:pkce.state}));
+   }catch{
+    /* sessionStorage optional if popup callback returns in-memory */
+   }
+  }catch(err){
+   setSyncState('error');
+   setSyncMessage(err.message||'Could not start Google sign-in.');
+   return;
+  }
+
+  const popup=window.open(pkce.authUrl,'drawline-google-oauth','width=520,height=640');
+  if(!popup){
+   setSyncState('error');
+   setSyncMessage('Popup blocked. Allow popups for this site and try again.');
+   return;
+  }
+
+  let settled=false;
+  let channel=null;
+  const cleanup=()=>{
+   window.removeEventListener('message',onMessage);
+   if(channel){try{channel.close();}catch{/* ignore */}}
+   clearInterval(pollTimer);
+  };
+  const handleCallback=async payload=>{
+   if(settled||!payload||payload.type!=='drawline-oauth-callback')return;
+   settled=true;
+   cleanup();
+   try{sessionStorage.removeItem(PKCE_SESSION_KEY);}catch{/* ignore */}
+   if(payload.error){
+    setSyncState('error');
+    setSyncMessage(payload.error==='access_denied'?'Google sign-in was cancelled.':'Google sign-in failed.');
+    return;
+   }
+   if(!payload.code||payload.state!==pkce.state){
+    setSyncState('error');
+    setSyncMessage('Sign-in state mismatch. Please try signing in again.');
+    return;
+   }
+   try{
+    const token=await exchangeCodeForToken({
+     code:payload.code,
+     codeVerifier:pkce.codeVerifier,
+     clientId:GOOGLE_OAUTH_CLIENT_ID
+    });
+    setAccessToken(token);
+    await runDriveSync(savedRef.current,deletedRef.current);
+   }catch(err){
+    setSyncState('error');
+    setSyncMessage(err.message||'Could not complete Google sign-in.');
+   }
+  };
+  const onMessage=e=>{
+   if(e.origin===location.origin)handleCallback(e.data);
+  };
+  window.addEventListener('message',onMessage);
+  try{
+   if(typeof BroadcastChannel!=='undefined'){
+    channel=new BroadcastChannel(AUTH_CHANNEL_NAME);
+    channel.onmessage=e=>handleCallback(e.data);
+   }
+  }catch{/* ignore */}
+  const pollTimer=setInterval(()=>{
+   if(popup.closed&&!settled){
+    settled=true;
+    cleanup();
+    if(!getAccessToken()){
+     setSyncState('error');
+     setSyncMessage('Google sign-in was closed before completing.');
+    }
+   }
+  },500);
  }
 
  function handleExport(){
@@ -307,7 +514,9 @@ function App(){
   if(!file)return;
   try{
    const merged=mergeImportedLines(saved,await file.text());
-   persist(merged);
+   const importedIds=new Set(merged.map(l=>l.id));
+   const nextDeleted=deletedIds.filter(id=>!importedIds.has(id));
+   persist(merged,nextDeleted);
    setImportNotice('');
   }catch(err){
    setImportNotice(err.message||'That file is not a Drawline lines file. Nothing was imported.');
@@ -472,6 +681,38 @@ function App(){
         />
        </div>
       </div>
+      <div className="sync-bar" aria-live="polite">
+       {!GOOGLE_OAUTH_CLIENT_ID||syncState==='unconfigured'?(
+        <span className="sync-status">Sync not set up yet</span>
+       ):syncState==='synced'&&lastSyncedAt?(
+        <span className="sync-status">Sync: on · last synced {fmtSyncTime(lastSyncedAt)}</span>
+       ):syncState==='syncing'?(
+        <span className="sync-status">Sync: syncing…</span>
+       ):syncState==='offline'?(
+        <span className="sync-status">Sync: offline — showing local copy</span>
+       ):syncState==='reauth'?(
+        <>
+         <span className="sync-status sync-err">Sync: session expired</span>
+         <button type="button" className="text-action sync-action" onClick={handleGoogleSignIn}>Sign in again</button>
+        </>
+       ):syncState==='error'?(
+        <>
+         <span className="sync-status sync-err">{syncMessage||'Sync error'}</span>
+         <button
+          type="button"
+          className="text-action sync-action"
+          onClick={()=>getAccessToken()?runDriveSync():handleGoogleSignIn()}
+         >
+          {getAccessToken()?'Retry':'Sign in with Google'}
+         </button>
+        </>
+       ):(
+        <>
+         <span className="sync-status">Sync: not signed in</span>
+         <button type="button" className="text-action sync-action" onClick={handleGoogleSignIn}>Sign in with Google</button>
+        </>
+       )}
+      </div>
       {storageError&&<p role="alert" className="alert-msg">{storageError}</p>}
       {importNotice&&<p role="alert" className="alert-msg">{importNotice}</p>}
       {!saved.length?(
@@ -493,7 +734,8 @@ function App(){
            aria-label={`Delete ${GAMES[line.game].name} line ${line.numbers.join(', ')}`}
            onClick={()=>{
             setImportNotice('');
-            persist(saved.filter(s=>s.id!==line.id));
+            const nextDeleted=deletedIds.includes(line.id)?deletedIds:[...deletedIds,line.id];
+            persist(saved.filter(s=>s.id!==line.id),nextDeleted);
            }}
           >
            Delete
