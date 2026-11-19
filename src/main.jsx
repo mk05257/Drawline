@@ -5,14 +5,14 @@ import {nextDraw,drawDate,countdownParts} from './schedule.mjs';
 import {describe,checkLine,newestDrawMatches,recentDraws} from './history.mjs';
 import {readSaved,writeSaved,exportSavedLines,mergeImportedLines} from './storage.mjs';
 import {loadHistory} from './history-storage.mjs';
-import {GOOGLE_OAUTH_CLIENT_ID,DRIVE_SCOPE} from './drive-config.mjs';
+import {GOOGLE_OAUTH_CLIENT_ID,DRIVE_SCOPE,REDIRECT_URI} from './drive-config.mjs';
 import {
  getAccessToken,
  clearAccessToken,
  readDeletedIds,
  writeDeletedIds,
- requestGoogleAccessToken,
- reauthGoogleAccessToken,
+ startGoogleSignIn,
+ consumeOAuthRedirect,
  syncSavedLines,
  UnauthorizedDriveError
 } from './drive-sync.mjs';
@@ -287,7 +287,7 @@ function App(){
  const savedRef=useRef([]);
  const deletedRef=useRef([]);
 
- async function runDriveSync(nextLines=savedRef.current,nextDeleted=deletedRef.current,{allowSilentReauth=true}={}){
+ async function runDriveSync(nextLines=savedRef.current,nextDeleted=deletedRef.current){
   if(!GOOGLE_OAUTH_CLIENT_ID){
    setSyncState('unconfigured');
    return;
@@ -333,17 +333,6 @@ function App(){
   }catch(err){
    if(err instanceof UnauthorizedDriveError||err?.status===401){
     clearAccessToken();
-    if(allowSilentReauth){
-     try{
-      await reauthGoogleAccessToken({
-       clientId:GOOGLE_OAUTH_CLIENT_ID,
-       scope:DRIVE_SCOPE
-      });
-      return await runDriveSync(nextLines,nextDeleted,{allowSilentReauth:false});
-     }catch{
-      /* Silent re-auth returned no token or an error; fall back to prompting again. */
-     }
-    }
     setSyncState('reauth');
     setSyncMessage('Sign in again');
    }else{
@@ -365,6 +354,19 @@ function App(){
    setDeletedIds(initialDeleted);
   }catch(e){
    setStorageError(e.message||'Local storage unavailable.');
+  }
+  const oauthResult=consumeOAuthRedirect({
+   loc:window.location,
+   hist:window.history,
+   storage:window.sessionStorage
+  });
+  if(oauthResult.handled){
+   if(oauthResult.ok){
+    runDriveSync(initialLines,initialDeleted);
+   }else{
+    setSyncState('error');
+    setSyncMessage(oauthResult.message||'Could not complete Google sign-in.');
+   }
   }
   const tick=setInterval(()=>setNow(new Date()),1000);
   const route=()=>setPage(location.hash==='#history'?'history':'picker');
@@ -411,19 +413,19 @@ function App(){
   persist([{...line,id:crypto.randomUUID(),savedAt:new Date().toISOString()},...saved],deletedIds);
  }
 
- async function handleGoogleSignIn(){
+ function handleGoogleSignIn(prompt='consent'){
   if(!GOOGLE_OAUTH_CLIENT_ID){
    setSyncState('unconfigured');
    return;
   }
   setSyncMessage('');
   try{
-   await requestGoogleAccessToken({
+   startGoogleSignIn({
     clientId:GOOGLE_OAUTH_CLIENT_ID,
+    redirectUri:REDIRECT_URI,
     scope:DRIVE_SCOPE,
-    prompt:'consent'
+    prompt
    });
-   await runDriveSync(savedRef.current,deletedRef.current);
   }catch(err){
    setSyncState('error');
    setSyncMessage(err.message||'Could not complete Google sign-in.');
@@ -625,7 +627,7 @@ function App(){
        ):syncState==='reauth'?(
         <>
          <span className="sync-status sync-err">Sync: session expired</span>
-         <button type="button" className="text-action sync-action" onClick={handleGoogleSignIn}>Sign in again</button>
+         <button type="button" className="text-action sync-action" onClick={()=>handleGoogleSignIn('')}>Sign in again</button>
         </>
        ):syncState==='error'?(
         <>
@@ -633,7 +635,7 @@ function App(){
          <button
           type="button"
           className="text-action sync-action"
-          onClick={()=>getAccessToken()?runDriveSync():handleGoogleSignIn()}
+          onClick={()=>getAccessToken()?runDriveSync():handleGoogleSignIn('consent')}
          >
           {getAccessToken()?'Retry':'Sign in with Google'}
          </button>
@@ -641,7 +643,7 @@ function App(){
        ):(
         <>
          <span className="sync-status">Sync: not signed in</span>
-         <button type="button" className="text-action sync-action" onClick={handleGoogleSignIn}>Sign in with Google</button>
+         <button type="button" className="text-action sync-action" onClick={()=>handleGoogleSignIn('consent')}>Sign in with Google</button>
         </>
        )}
       </div>

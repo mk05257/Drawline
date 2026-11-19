@@ -3,12 +3,13 @@ import {
   GOOGLE_OAUTH_CLIENT_ID,
   DRIVE_FOLDER_ID,
   DRIVE_LINES_FILENAME,
-  DRIVE_SCOPE
+  DRIVE_SCOPE,
+  REDIRECT_URI
 } from './drive-config.mjs';
 
 export const DELETED_STORAGE_KEY = 'drawline.deleted.v1';
-export const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
-export const GIS_LOAD_ERROR = 'Could not load Google sign-in. Check your connection and try again.';
+export const OAUTH_STATE_KEY = 'drawline.oauth.state.v1';
+export const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 
 const DRIVE_FILES_ENDPOINT = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD_ENDPOINT = 'https://www.googleapis.com/upload/drive/v3/files';
@@ -113,188 +114,184 @@ export function mergeWithRemote({localLines = [], localDeletedIds = [], remoteTe
   };
 }
 
-// --- Google Identity Services (GIS) lazy loader & token client ---
+// --- OAuth 2.0 full-page redirect implicit flow (response_type=token) ---
 
-let gisLoadPromise = null;
-
-export function resetGisLoader() {
-  gisLoadPromise = null;
+function base64UrlEncode(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function loadGisScript({
-  doc = typeof document !== 'undefined' ? document : null,
-  win = typeof window !== 'undefined' ? window : globalThis
-} = {}) {
-  if (win?.google?.accounts?.oauth2?.initTokenClient) {
-    return Promise.resolve(win.google.accounts.oauth2);
+export function generateOAuthState(byteLength = 24, cryptoObj = globalThis.crypto) {
+  if (!cryptoObj || typeof cryptoObj.getRandomValues !== 'function') {
+    throw new Error('Secure random generator unavailable.');
   }
-  if (gisLoadPromise) {
-    return gisLoadPromise;
-  }
-  if (!doc || typeof doc.createElement !== 'function') {
-    return Promise.reject(new Error(GIS_LOAD_ERROR));
-  }
-
-  gisLoadPromise = new Promise((resolve, reject) => {
-    const script = doc.createElement('script');
-    script.src = GIS_SCRIPT_URL;
-    script.async = true;
-    script.defer = true;
-
-    script.onload = () => {
-      const oauth2 = win?.google?.accounts?.oauth2;
-      if (oauth2 && typeof oauth2.initTokenClient === 'function') {
-        resolve(oauth2);
-      } else {
-        gisLoadPromise = null;
-        reject(new Error(GIS_LOAD_ERROR));
-      }
-    };
-
-    script.onerror = () => {
-      gisLoadPromise = null;
-      if (typeof script.remove === 'function') script.remove();
-      reject(new Error(GIS_LOAD_ERROR));
-    };
-
-    const parent = doc.head || doc.documentElement || doc.body;
-    if (!parent || typeof parent.appendChild !== 'function') {
-      gisLoadPromise = null;
-      reject(new Error(GIS_LOAD_ERROR));
-      return;
-    }
-    parent.appendChild(script);
-  });
-
-  return gisLoadPromise;
+  const bytes = new Uint8Array(byteLength);
+  cryptoObj.getRandomValues(bytes);
+  return base64UrlEncode(bytes);
 }
 
-export function formatGisError(err) {
-  const code = typeof err === 'string' ? err : err?.error || err?.type || '';
-  if (code === 'access_denied') {
-    return 'Google sign-in was cancelled.';
-  }
-  if (code === 'popup_closed') {
-    return 'Google sign-in was closed before completing.';
-  }
-  if (code === 'popup_failed_to_open') {
-    return 'Popup blocked. Allow popups for this site and try again.';
-  }
-  if (err instanceof Error && err.message) {
-    return err.message;
-  }
-  return 'Could not complete Google sign-in.';
-}
-
-export async function requestGoogleAccessToken({
+export function buildGoogleAuthUrl({
   clientId = GOOGLE_OAUTH_CLIENT_ID,
+  redirectUri = REDIRECT_URI,
   scope = DRIVE_SCOPE,
-  prompt = 'consent',
-  loadGis = loadGisScript,
-  doc,
-  win
+  state,
+  prompt = 'consent'
 } = {}) {
   if (!clientId) {
     throw new Error('Sync not set up yet');
   }
-
-  const oauth2 = await loadGis(doc || win ? {doc, win} : undefined);
-
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    const finishResolve = token => {
-      if (settled) return;
-      settled = true;
-      setAccessToken(token);
-      resolve(token);
-    };
-    const finishReject = err => {
-      if (settled) return;
-      settled = true;
-      reject(err instanceof Error ? err : new Error(formatGisError(err)));
-    };
-
-    let tokenClient;
-    try {
-      tokenClient = oauth2.initTokenClient({
-        client_id: clientId,
-        scope,
-        callback: response => {
-          if (response?.error) {
-            finishReject(new Error(formatGisError(response)));
-            return;
-          }
-          if (!response || typeof response.access_token !== 'string' || !response.access_token) {
-            finishReject(new Error('Google did not return an access token.'));
-            return;
-          }
-          finishResolve(response.access_token);
-        },
-        error_callback: err => {
-          finishReject(new Error(formatGisError(err)));
-        }
-      });
-    } catch (err) {
-      finishReject(new Error(formatGisError(err)));
-      return;
-    }
-
-    try {
-      tokenClient.requestAccessToken({prompt});
-    } catch (err) {
-      finishReject(new Error(formatGisError(err)));
-    }
-  });
-}
-
-export async function reauthGoogleAccessToken({
-  clientId = GOOGLE_OAUTH_CLIENT_ID,
-  scope = DRIVE_SCOPE,
-  loadGis = loadGisScript,
-  doc,
-  win
-} = {}) {
-  try {
-    return await requestGoogleAccessToken({
-      clientId,
-      scope,
-      prompt: '',
-      loadGis,
-      doc,
-      win
-    });
-  } catch {
-    clearAccessToken();
-    throw new UnauthorizedDriveError('Sign in again');
+  if (!redirectUri) {
+    throw new Error('Missing redirect URI.');
   }
+  if (!state) {
+    throw new Error('Missing OAuth state.');
+  }
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'token',
+    scope,
+    state
+  });
+  if (prompt) {
+    params.set('prompt', prompt);
+  }
+  return `${GOOGLE_AUTH_ENDPOINT}?${params.toString()}`;
 }
 
-export async function signInAndSync({
-  localLines = [],
-  localDeletedIds = [],
+export function startGoogleSignIn({
   clientId = GOOGLE_OAUTH_CLIENT_ID,
+  redirectUri = REDIRECT_URI,
   scope = DRIVE_SCOPE,
   prompt = 'consent',
-  loadGis = loadGisScript,
-  doc,
-  win,
+  storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+  loc = typeof window !== 'undefined' ? window.location : null,
+  cryptoObj = globalThis.crypto
+} = {}) {
+  if (!clientId) {
+    throw new Error('Sync not set up yet');
+  }
+  const state = generateOAuthState(24, cryptoObj);
+  if (!storage || typeof storage.setItem !== 'function') {
+    throw new Error('Session storage unavailable. Cannot start Google sign-in.');
+  }
+  storage.setItem(OAUTH_STATE_KEY, state);
+  const url = buildGoogleAuthUrl({clientId, redirectUri, scope, state, prompt});
+  if (!loc || typeof loc.assign !== 'function') {
+    throw new Error('Cannot navigate to Google sign-in.');
+  }
+  loc.assign(url);
+  return {state, url};
+}
+
+function scrubOAuthFragment(loc, hist) {
+  if (!hist || typeof hist.replaceState !== 'function') return;
+  const cleanUrl =
+    typeof loc?.pathname === 'string'
+      ? `${loc.pathname}${loc.search || ''}`
+      : typeof loc?.href === 'string'
+        ? loc.href.split('#')[0]
+        : '/';
+  hist.replaceState(null, '', cleanUrl);
+}
+
+export function consumeOAuthRedirect({
+  loc = typeof window !== 'undefined' ? window.location : null,
+  hist = typeof window !== 'undefined' ? window.history : null,
+  storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+  hash = loc?.hash ?? ''
+} = {}) {
+  const rawHash = typeof hash === 'string' ? hash.replace(/^#/, '') : '';
+  if (!rawHash) {
+    return {handled: false};
+  }
+
+  const params = new URLSearchParams(rawHash);
+  const isOAuthFragment =
+    params.has('access_token') ||
+    params.has('error') ||
+    params.has('state') ||
+    params.has('token_type');
+
+  if (!isOAuthFragment) {
+    return {handled: false};
+  }
+
+  // Scrub the fragment from the address bar immediately before any navigation or sync call.
+  scrubOAuthFragment(loc, hist);
+
+  let expectedState = null;
+  try {
+    expectedState = storage?.getItem?.(OAUTH_STATE_KEY) || null;
+    storage?.removeItem?.(OAUTH_STATE_KEY);
+  } catch {
+    expectedState = null;
+  }
+
+  const errorCode = params.get('error');
+  if (errorCode) {
+    const message =
+      errorCode === 'access_denied'
+        ? 'Google sign-in was cancelled.'
+        : 'Could not complete Google sign-in.';
+    return {handled: true, ok: false, error: errorCode, message};
+  }
+
+  const returnedState = params.get('state');
+  if (!expectedState || !returnedState || returnedState !== expectedState) {
+    return {
+      handled: true,
+      ok: false,
+      error: 'state_mismatch',
+      message: "Sign-in didn't match. Please try signing in again."
+    };
+  }
+
+  const accessToken = params.get('access_token');
+  if (!accessToken) {
+    return {
+      handled: true,
+      ok: false,
+      error: 'missing_token',
+      message: 'Google did not return an access token.'
+    };
+  }
+
+  setAccessToken(accessToken);
+  return {handled: true, ok: true, token: accessToken};
+}
+
+export async function completeOAuthRedirectAndSync({
+  localLines = [],
+  localDeletedIds = [],
+  loc = typeof window !== 'undefined' ? window.location : null,
+  hist = typeof window !== 'undefined' ? window.history : null,
+  storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+  hash = loc?.hash ?? '',
   fetcher = fetch,
   online = typeof navigator === 'undefined' ? true : navigator.onLine !== false,
   knownFileId = null,
   folderId = DRIVE_FOLDER_ID,
   fileName = DRIVE_LINES_FILENAME
 } = {}) {
-  const token = await requestGoogleAccessToken({clientId, scope, prompt, loadGis, doc, win});
-  return await syncSavedLines({
+  const auth = consumeOAuthRedirect({loc, hist, storage, hash});
+  if (!auth.handled || !auth.ok) {
+    return auth;
+  }
+  const sync = await syncSavedLines({
     localLines,
     localDeletedIds,
-    token,
+    token: auth.token,
     fetcher,
     online,
     knownFileId,
     folderId,
     fileName
   });
+  return {handled: true, ok: true, token: auth.token, sync};
 }
 
 // --- Drive API client (injectable fetch, private file only) ---
