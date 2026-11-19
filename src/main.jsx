@@ -5,20 +5,16 @@ import {nextDraw,drawDate,countdownParts} from './schedule.mjs';
 import {describe,checkLine,newestDrawMatches,recentDraws} from './history.mjs';
 import {readSaved,writeSaved,exportSavedLines,mergeImportedLines} from './storage.mjs';
 import {loadHistory} from './history-storage.mjs';
-import {GOOGLE_OAUTH_CLIENT_ID} from './drive-config.mjs';
+import {GOOGLE_OAUTH_CLIENT_ID,DRIVE_SCOPE} from './drive-config.mjs';
 import {
  getAccessToken,
- setAccessToken,
  clearAccessToken,
  readDeletedIds,
  writeDeletedIds,
- createPkceRequest,
- exchangeCodeForToken,
- handleOAuthRedirectIfPresent,
+ requestGoogleAccessToken,
+ reauthGoogleAccessToken,
  syncSavedLines,
- UnauthorizedDriveError,
- PKCE_SESSION_KEY,
- AUTH_CHANNEL_NAME
+ UnauthorizedDriveError
 } from './drive-sync.mjs';
 import './style.css';
 
@@ -291,7 +287,7 @@ function App(){
  const savedRef=useRef([]);
  const deletedRef=useRef([]);
 
- async function runDriveSync(nextLines=savedRef.current,nextDeleted=deletedRef.current){
+ async function runDriveSync(nextLines=savedRef.current,nextDeleted=deletedRef.current,{allowSilentReauth=true}={}){
   if(!GOOGLE_OAUTH_CLIENT_ID){
    setSyncState('unconfigured');
    return;
@@ -337,6 +333,17 @@ function App(){
   }catch(err){
    if(err instanceof UnauthorizedDriveError||err?.status===401){
     clearAccessToken();
+    if(allowSilentReauth){
+     try{
+      await reauthGoogleAccessToken({
+       clientId:GOOGLE_OAUTH_CLIENT_ID,
+       scope:DRIVE_SCOPE
+      });
+      return await runDriveSync(nextLines,nextDeleted,{allowSilentReauth:false});
+     }catch{
+      /* Silent re-auth returned no token or an error; fall back to prompting again. */
+     }
+    }
     setSyncState('reauth');
     setSyncMessage('Sign in again');
    }else{
@@ -366,16 +373,6 @@ function App(){
   addEventListener('hashchange',route);
   addEventListener('online',onOnline);
   addEventListener('offline',onOffline);
-
-  handleOAuthRedirectIfPresent().then(res=>{
-   if(!res||res.handledInPopup)return;
-   if(res.ok){
-    runDriveSync(savedRef.current,deletedRef.current);
-   }else if(res.error){
-    setSyncState('error');
-    setSyncMessage(res.error);
-   }
-  });
 
   return ()=>{
    clearInterval(tick);
@@ -420,82 +417,17 @@ function App(){
    return;
   }
   setSyncMessage('');
-  let pkce;
   try{
-   pkce=await createPkceRequest({clientId:GOOGLE_OAUTH_CLIENT_ID});
-   try{
-    sessionStorage.setItem(PKCE_SESSION_KEY,JSON.stringify({codeVerifier:pkce.codeVerifier,state:pkce.state}));
-   }catch{
-    /* sessionStorage optional if popup callback returns in-memory */
-   }
+   await requestGoogleAccessToken({
+    clientId:GOOGLE_OAUTH_CLIENT_ID,
+    scope:DRIVE_SCOPE,
+    prompt:'consent'
+   });
+   await runDriveSync(savedRef.current,deletedRef.current);
   }catch(err){
    setSyncState('error');
-   setSyncMessage(err.message||'Could not start Google sign-in.');
-   return;
+   setSyncMessage(err.message||'Could not complete Google sign-in.');
   }
-
-  const popup=window.open(pkce.authUrl,'drawline-google-oauth','width=520,height=640');
-  if(!popup){
-   setSyncState('error');
-   setSyncMessage('Popup blocked. Allow popups for this site and try again.');
-   return;
-  }
-
-  let settled=false;
-  let channel=null;
-  const cleanup=()=>{
-   window.removeEventListener('message',onMessage);
-   if(channel){try{channel.close();}catch{/* ignore */}}
-   clearInterval(pollTimer);
-  };
-  const handleCallback=async payload=>{
-   if(settled||!payload||payload.type!=='drawline-oauth-callback')return;
-   settled=true;
-   cleanup();
-   try{sessionStorage.removeItem(PKCE_SESSION_KEY);}catch{/* ignore */}
-   if(payload.error){
-    setSyncState('error');
-    setSyncMessage(payload.error==='access_denied'?'Google sign-in was cancelled.':'Google sign-in failed.');
-    return;
-   }
-   if(!payload.code||payload.state!==pkce.state){
-    setSyncState('error');
-    setSyncMessage('Sign-in state mismatch. Please try signing in again.');
-    return;
-   }
-   try{
-    const token=await exchangeCodeForToken({
-     code:payload.code,
-     codeVerifier:pkce.codeVerifier,
-     clientId:GOOGLE_OAUTH_CLIENT_ID
-    });
-    setAccessToken(token);
-    await runDriveSync(savedRef.current,deletedRef.current);
-   }catch(err){
-    setSyncState('error');
-    setSyncMessage(err.message||'Could not complete Google sign-in.');
-   }
-  };
-  const onMessage=e=>{
-   if(e.origin===location.origin)handleCallback(e.data);
-  };
-  window.addEventListener('message',onMessage);
-  try{
-   if(typeof BroadcastChannel!=='undefined'){
-    channel=new BroadcastChannel(AUTH_CHANNEL_NAME);
-    channel.onmessage=e=>handleCallback(e.data);
-   }
-  }catch{/* ignore */}
-  const pollTimer=setInterval(()=>{
-   if(popup.closed&&!settled){
-    settled=true;
-    cleanup();
-    if(!getAccessToken()){
-     setSyncState('error');
-     setSyncMessage('Google sign-in was closed before completing.');
-    }
-   }
-  },500);
  }
 
  function handleExport(){

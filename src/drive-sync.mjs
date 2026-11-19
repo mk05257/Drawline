@@ -3,16 +3,13 @@ import {
   GOOGLE_OAUTH_CLIENT_ID,
   DRIVE_FOLDER_ID,
   DRIVE_LINES_FILENAME,
-  DRIVE_SCOPE,
-  REDIRECT_URI
+  DRIVE_SCOPE
 } from './drive-config.mjs';
 
 export const DELETED_STORAGE_KEY = 'drawline.deleted.v1';
-export const PKCE_SESSION_KEY = 'drawline.oauth.pkce.v1';
-export const AUTH_CHANNEL_NAME = 'drawline.oauth.callback.v1';
+export const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
+export const GIS_LOAD_ERROR = 'Could not load Google sign-in. Check your connection and try again.';
 
-const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
-const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const DRIVE_FILES_ENDPOINT = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD_ENDPOINT = 'https://www.googleapis.com/upload/drive/v3/files';
 
@@ -116,166 +113,188 @@ export function mergeWithRemote({localLines = [], localDeletedIds = [], remoteTe
   };
 }
 
-// --- PKCE (S256) helpers ---
+// --- Google Identity Services (GIS) lazy loader & token client ---
 
-function base64UrlEncode(bytes) {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+let gisLoadPromise = null;
+
+export function resetGisLoader() {
+  gisLoadPromise = null;
 }
 
-export function generateRandomUrlSafe(byteLength = 32) {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return base64UrlEncode(bytes);
-}
-
-export async function computeCodeChallenge(verifier) {
-  const data = new TextEncoder().encode(verifier);
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  return base64UrlEncode(new Uint8Array(digest));
-}
-
-export async function createPkceRequest({
-  clientId = GOOGLE_OAUTH_CLIENT_ID,
-  redirectUri = REDIRECT_URI,
-  scope = DRIVE_SCOPE
+export function loadGisScript({
+  doc = typeof document !== 'undefined' ? document : null,
+  win = typeof window !== 'undefined' ? window : globalThis
 } = {}) {
-  if (!clientId) throw Error('Sync not set up yet');
-  const codeVerifier = generateRandomUrlSafe(32);
-  const state = generateRandomUrlSafe(16);
-  const codeChallenge = await computeCodeChallenge(codeVerifier);
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: 'code',
-    scope,
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
-    state
-  });
-  return {
-    authUrl: `${AUTH_ENDPOINT}?${params.toString()}`,
-    codeVerifier,
-    state
-  };
-}
-
-export async function exchangeCodeForToken({
-  code,
-  codeVerifier,
-  clientId = GOOGLE_OAUTH_CLIENT_ID,
-  redirectUri = REDIRECT_URI,
-  fetcher = fetch
-}) {
-  if (!clientId) throw Error('Sync not set up yet');
-  if (!code || !codeVerifier) throw Error('Missing authorization code or PKCE verifier.');
-  const body = new URLSearchParams({
-    client_id: clientId,
-    code,
-    code_verifier: codeVerifier,
-    grant_type: 'authorization_code',
-    redirect_uri: redirectUri
-  });
-  const response = await fetcher(TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: body.toString()
-  });
-  if (!response.ok) {
-    throw Error('Could not complete Google sign-in.');
+  if (win?.google?.accounts?.oauth2?.initTokenClient) {
+    return Promise.resolve(win.google.accounts.oauth2);
   }
-  const data = await response.json();
-  if (!data || typeof data.access_token !== 'string' || !data.access_token) {
-    throw Error('Google did not return an access token.');
+  if (gisLoadPromise) {
+    return gisLoadPromise;
   }
-  return data.access_token;
-}
-
-export async function handleOAuthRedirectIfPresent({
-  loc = globalThis.location,
-  hist = globalThis.history,
-  sessionStore = globalThis.sessionStorage,
-  clientId = GOOGLE_OAUTH_CLIENT_ID,
-  redirectUri = REDIRECT_URI,
-  fetcher = fetch,
-  notifyOpener = true
-} = {}) {
-  if (!loc?.search) return null;
-  const params = new URLSearchParams(loc.search);
-  const code = params.get('code');
-  const error = params.get('error');
-  const state = params.get('state');
-  if (!code && !error) return null;
-
-  // Clean the URL immediately so code/state never linger in history or address bar.
-  const cleanUrl = `${loc.pathname || '/'}${loc.hash || ''}`;
-  try {
-    hist?.replaceState?.(null, '', cleanUrl);
-  } catch {
-    /* ignore history replace errors in restricted contexts */
+  if (!doc || typeof doc.createElement !== 'function') {
+    return Promise.reject(new Error(GIS_LOAD_ERROR));
   }
 
-  // If running inside the OAuth popup, relay the callback parameters to the opener and close.
-  if (notifyOpener && typeof globalThis.window !== 'undefined') {
-    const payload = {type: 'drawline-oauth-callback', code, error, state};
-    let relayed = false;
-    try {
-      if (typeof BroadcastChannel !== 'undefined') {
-        const ch = new BroadcastChannel(AUTH_CHANNEL_NAME);
-        ch.postMessage(payload);
-        ch.close();
-        relayed = true;
+  gisLoadPromise = new Promise((resolve, reject) => {
+    const script = doc.createElement('script');
+    script.src = GIS_SCRIPT_URL;
+    script.async = true;
+    script.defer = true;
+
+    script.onload = () => {
+      const oauth2 = win?.google?.accounts?.oauth2;
+      if (oauth2 && typeof oauth2.initTokenClient === 'function') {
+        resolve(oauth2);
+      } else {
+        gisLoadPromise = null;
+        reject(new Error(GIS_LOAD_ERROR));
       }
-    } catch {
-      /* ignore BroadcastChannel errors */
-    }
-    try {
-      if (globalThis.window.opener && globalThis.window.opener !== globalThis.window) {
-        globalThis.window.opener.postMessage(payload, loc.origin);
-        relayed = true;
-      }
-    } catch {
-      /* ignore opener postMessage errors */
-    }
-    if (relayed && globalThis.window.opener) {
-      try { globalThis.window.close(); } catch { /* ignore */ }
-      return {handledInPopup: true};
-    }
-  }
-
-  if (error) {
-    return {
-      ok: false,
-      error: error === 'access_denied' ? 'Google sign-in was cancelled.' : 'Google sign-in failed.'
     };
+
+    script.onerror = () => {
+      gisLoadPromise = null;
+      if (typeof script.remove === 'function') script.remove();
+      reject(new Error(GIS_LOAD_ERROR));
+    };
+
+    const parent = doc.head || doc.documentElement || doc.body;
+    if (!parent || typeof parent.appendChild !== 'function') {
+      gisLoadPromise = null;
+      reject(new Error(GIS_LOAD_ERROR));
+      return;
+    }
+    parent.appendChild(script);
+  });
+
+  return gisLoadPromise;
+}
+
+export function formatGisError(err) {
+  const code = typeof err === 'string' ? err : err?.error || err?.type || '';
+  if (code === 'access_denied') {
+    return 'Google sign-in was cancelled.';
+  }
+  if (code === 'popup_closed') {
+    return 'Google sign-in was closed before completing.';
+  }
+  if (code === 'popup_failed_to_open') {
+    return 'Popup blocked. Allow popups for this site and try again.';
+  }
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  return 'Could not complete Google sign-in.';
+}
+
+export async function requestGoogleAccessToken({
+  clientId = GOOGLE_OAUTH_CLIENT_ID,
+  scope = DRIVE_SCOPE,
+  prompt = 'consent',
+  loadGis = loadGisScript,
+  doc,
+  win
+} = {}) {
+  if (!clientId) {
+    throw new Error('Sync not set up yet');
   }
 
-  let stored = null;
+  const oauth2 = await loadGis(doc || win ? {doc, win} : undefined);
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const finishResolve = token => {
+      if (settled) return;
+      settled = true;
+      setAccessToken(token);
+      resolve(token);
+    };
+    const finishReject = err => {
+      if (settled) return;
+      settled = true;
+      reject(err instanceof Error ? err : new Error(formatGisError(err)));
+    };
+
+    let tokenClient;
+    try {
+      tokenClient = oauth2.initTokenClient({
+        client_id: clientId,
+        scope,
+        callback: response => {
+          if (response?.error) {
+            finishReject(new Error(formatGisError(response)));
+            return;
+          }
+          if (!response || typeof response.access_token !== 'string' || !response.access_token) {
+            finishReject(new Error('Google did not return an access token.'));
+            return;
+          }
+          finishResolve(response.access_token);
+        },
+        error_callback: err => {
+          finishReject(new Error(formatGisError(err)));
+        }
+      });
+    } catch (err) {
+      finishReject(new Error(formatGisError(err)));
+      return;
+    }
+
+    try {
+      tokenClient.requestAccessToken({prompt});
+    } catch (err) {
+      finishReject(new Error(formatGisError(err)));
+    }
+  });
+}
+
+export async function reauthGoogleAccessToken({
+  clientId = GOOGLE_OAUTH_CLIENT_ID,
+  scope = DRIVE_SCOPE,
+  loadGis = loadGisScript,
+  doc,
+  win
+} = {}) {
   try {
-    stored = JSON.parse(sessionStore?.getItem?.(PKCE_SESSION_KEY) || 'null');
-    sessionStore?.removeItem?.(PKCE_SESSION_KEY);
-  } catch {
-    stored = null;
-  }
-
-  if (!stored || !stored.codeVerifier || !stored.state || stored.state !== state) {
-    return {ok: false, error: 'Sign-in state mismatch. Please try signing in again.'};
-  }
-
-  try {
-    const token = await exchangeCodeForToken({
-      code,
-      codeVerifier: stored.codeVerifier,
+    return await requestGoogleAccessToken({
       clientId,
-      redirectUri,
-      fetcher
+      scope,
+      prompt: '',
+      loadGis,
+      doc,
+      win
     });
-    setAccessToken(token);
-    return {ok: true, token};
-  } catch (err) {
-    return {ok: false, error: err.message || 'Could not complete Google sign-in.'};
+  } catch {
+    clearAccessToken();
+    throw new UnauthorizedDriveError('Sign in again');
   }
+}
+
+export async function signInAndSync({
+  localLines = [],
+  localDeletedIds = [],
+  clientId = GOOGLE_OAUTH_CLIENT_ID,
+  scope = DRIVE_SCOPE,
+  prompt = 'consent',
+  loadGis = loadGisScript,
+  doc,
+  win,
+  fetcher = fetch,
+  online = typeof navigator === 'undefined' ? true : navigator.onLine !== false,
+  knownFileId = null,
+  folderId = DRIVE_FOLDER_ID,
+  fileName = DRIVE_LINES_FILENAME
+} = {}) {
+  const token = await requestGoogleAccessToken({clientId, scope, prompt, loadGis, doc, win});
+  return await syncSavedLines({
+    localLines,
+    localDeletedIds,
+    token,
+    fetcher,
+    online,
+    knownFileId,
+    folderId,
+    fileName
+  });
 }
 
 // --- Drive API client (injectable fetch, private file only) ---

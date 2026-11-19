@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {exportSavedLines} from '../src/storage.mjs';
 import {
   GOOGLE_OAUTH_CLIENT_ID,
   DRIVE_FOLDER_ID,
   DRIVE_LINES_FILENAME,
   DRIVE_SCOPE,
-  AUTHORIZED_ORIGIN,
-  REDIRECT_URI
+  AUTHORIZED_ORIGIN
 } from '../src/drive-config.mjs';
 import {
   getAccessToken,
@@ -15,17 +15,17 @@ import {
   clearAccessToken,
   readDeletedIds,
   writeDeletedIds,
-  serializeDrivePayload,
   parseDrivePayload,
-  mergeWithRemote,
-  computeCodeChallenge,
-  createPkceRequest,
-  exchangeCodeForToken,
-  handleOAuthRedirectIfPresent,
+  GIS_SCRIPT_URL,
+  GIS_LOAD_ERROR,
+  resetGisLoader,
+  loadGisScript,
+  requestGoogleAccessToken,
+  reauthGoogleAccessToken,
+  signInAndSync,
   buildFindFileUrl,
   syncSavedLines,
-  UnauthorizedDriveError,
-  PKCE_SESSION_KEY
+  UnauthorizedDriveError
 } from '../src/drive-sync.mjs';
 
 const line1 = {
@@ -219,28 +219,12 @@ test('Offline sync makes no network calls and leaves local lines unchanged', asy
   assert.deepEqual(res.lines, [line1, line2]);
 });
 
-test('OAuth PKCE S256 parameters, Drive scope, query format, and 401 token clearing', async () => {
+test('Drive config, query format, CSP, deleted IDs persistence, and 401 token clearing', async () => {
   assert.equal(GOOGLE_OAUTH_CLIENT_ID, '472482125167-3vlb1ccp2706qmlf53beu7mimr0i7qlo.apps.googleusercontent.com');
   assert.equal(DRIVE_SCOPE, 'https://www.googleapis.com/auth/drive.file');
   assert.equal(AUTHORIZED_ORIGIN, 'https://mk05257.github.io');
-  assert.equal(REDIRECT_URI, 'https://mk05257.github.io/Drawline/');
   assert.equal(DRIVE_FOLDER_ID, '1_N5Bl2Rm5xkLiJ6qt2g-229AAkyrqvZg');
   assert.equal(DRIVE_LINES_FILENAME, 'drawline-lines.json');
-
-  // RFC 7636 Appendix B test vector for S256 challenge
-  const sampleVerifier = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
-  const challenge = await computeCodeChallenge(sampleVerifier);
-  assert.equal(challenge, 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
-
-  const pkce = await createPkceRequest({clientId: 'test-client-id'});
-  const authUrl = new URL(pkce.authUrl);
-  assert.equal(authUrl.origin + authUrl.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
-  assert.equal(authUrl.searchParams.get('client_id'), 'test-client-id');
-  assert.equal(authUrl.searchParams.get('redirect_uri'), 'https://mk05257.github.io/Drawline/');
-  assert.equal(authUrl.searchParams.get('response_type'), 'code');
-  assert.equal(authUrl.searchParams.get('scope'), 'https://www.googleapis.com/auth/drive.file');
-  assert.equal(authUrl.searchParams.get('code_challenge_method'), 'S256');
-  assert.equal(authUrl.searchParams.get('code_challenge'), await computeCodeChallenge(pkce.codeVerifier));
 
   // Verify find file query string matches exact specification
   const findUrl = new URL(buildFindFileUrl());
@@ -249,30 +233,11 @@ test('OAuth PKCE S256 parameters, Drive scope, query format, and 401 token clear
     "name='drawline-lines.json' and '1_N5Bl2Rm5xkLiJ6qt2g-229AAkyrqvZg' in parents and trashed=false"
   );
 
-  // Verify redirect handler exchanges code without client_secret and cleans URL via history.replaceState
-  const sessionMap = new Map([[PKCE_SESSION_KEY, JSON.stringify({codeVerifier: pkce.codeVerifier, state: pkce.state})]]);
-  let replacedUrl = null;
-  let tokenPostBody = null;
-  const redirectResult = await handleOAuthRedirectIfPresent({
-    loc: {search: `?code=auth-code-123&state=${pkce.state}`, pathname: '/Drawline/', hash: ''},
-    hist: {replaceState: (_s, _t, u) => { replacedUrl = u; }},
-    sessionStore: {
-      getItem: k => sessionMap.get(k) || null,
-      removeItem: k => sessionMap.delete(k)
-    },
-    clientId: 'test-client-id',
-    notifyOpener: false,
-    fetcher: async (_url, init) => {
-      tokenPostBody = new URLSearchParams(init.body);
-      return {ok: true, status: 200, json: async () => ({access_token: 'mem-token-xyz'})};
-    }
-  });
-  assert.equal(replacedUrl, '/Drawline/');
-  assert.equal(redirectResult.ok, true);
-  assert.equal(getAccessToken(), 'mem-token-xyz');
-  assert.equal(tokenPostBody.get('client_id'), 'test-client-id');
-  assert.equal(tokenPostBody.get('code_verifier'), pkce.codeVerifier);
-  assert.equal(tokenPostBody.get('client_secret'), null);
+  // Verify index.html has no static GIS script tag and CSP allows accounts.google.com in script-src without unsafe-inline
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.ok(!html.includes('accounts.google.com/gsi/client'), 'GIS script must not be statically loaded in index.html');
+  assert.match(html, /script-src 'self' https:\/\/accounts\.google\.com;/);
+  assert.doesNotMatch(html, /script-src[^;]*'unsafe-inline'/);
 
   // 401 clears in-memory token and throws UnauthorizedDriveError
   const drive = createFakeDrive(null);
@@ -289,4 +254,187 @@ test('OAuth PKCE S256 parameters, Drive scope, query format, and 401 token clear
   writeDeletedIds(s, ['line-1', 'line-1']);
   assert.deepEqual(readDeletedIds(s), ['line-1']);
   clearAccessToken();
+});
+
+function createFakeDom() {
+  const appended = [];
+  const doc = {
+    createElement(tag) {
+      return {
+        tagName: tag.toUpperCase(),
+        src: '',
+        async: false,
+        defer: false,
+        onload: null,
+        onerror: null,
+        removed: false,
+        remove() {
+          this.removed = true;
+        }
+      };
+    },
+    head: {
+      appendChild(el) {
+        appended.push(el);
+        return el;
+      }
+    }
+  };
+  return {doc, appended};
+}
+
+test('GIS loader injects the script only on a sign-in attempt and only once', async () => {
+  resetGisLoader();
+  clearAccessToken();
+  const {doc, appended} = createFakeDom();
+  const win = {};
+
+  // Nothing is injected before a sign-in attempt
+  assert.equal(appended.length, 0);
+
+  // Two concurrent load calls inject only one <script> tag and share the cached promise
+  const p1 = loadGisScript({doc, win});
+  const p2 = loadGisScript({doc, win});
+  assert.equal(p1, p2);
+  assert.equal(appended.length, 1);
+  assert.equal(appended[0].src, GIS_SCRIPT_URL);
+  assert.equal(appended[0].async, true);
+  assert.equal(appended[0].defer, true);
+
+  const fakeOAuth2 = {initTokenClient: () => ({requestAccessToken: () => {}})};
+  win.google = {accounts: {oauth2: fakeOAuth2}};
+  appended[0].onload();
+
+  const [res1, res2] = await Promise.all([p1, p2]);
+  assert.equal(res1, fakeOAuth2);
+  assert.equal(res2, fakeOAuth2);
+
+  // Subsequent sign-in attempt reuses loaded GIS without injecting another script
+  const res3 = await loadGisScript({doc, win});
+  assert.equal(res3, fakeOAuth2);
+  assert.equal(appended.length, 1);
+  resetGisLoader();
+});
+
+test('GIS token callback sets in-memory token and triggers Drive sync; re-auth uses prompt="" with Sign in again fallback', async () => {
+  resetGisLoader();
+  clearAccessToken();
+  const drive = createFakeDrive(exportSavedLines([line2]));
+  const initConfigs = [];
+  const prompts = [];
+  let nextResponse = {access_token: 'valid-token'};
+
+  const fakeOAuth2 = {
+    initTokenClient(config) {
+      initConfigs.push(config);
+      return {
+        requestAccessToken(opts) {
+          prompts.push(opts?.prompt);
+          config.callback(nextResponse);
+        }
+      };
+    }
+  };
+
+  const syncResult = await signInAndSync({
+    localLines: [line1],
+    localDeletedIds: [],
+    loadGis: async () => fakeOAuth2,
+    fetcher: drive.fetcher,
+    online: true
+  });
+
+  assert.equal(initConfigs.length, 1);
+  assert.equal(initConfigs[0].client_id, GOOGLE_OAUTH_CLIENT_ID);
+  assert.equal(initConfigs[0].scope, DRIVE_SCOPE);
+  assert.equal(prompts[0], 'consent');
+  assert.equal(getAccessToken(), 'valid-token');
+  assert.equal(syncResult.status, 'synced');
+  assert.deepEqual(new Set(syncResult.lines.map(l => l.id)), new Set(['line-1', 'line-2']));
+
+  // Re-auth after expiry uses prompt: '' silently when granted
+  clearAccessToken();
+  nextResponse = {access_token: 'refreshed-token'};
+  const refreshed = await reauthGoogleAccessToken({loadGis: async () => fakeOAuth2});
+  assert.equal(prompts[1], '');
+  assert.equal(refreshed, 'refreshed-token');
+  assert.equal(getAccessToken(), 'refreshed-token');
+
+  // If silent re-auth returns no token or an error, it falls back with a clear "Sign in again" message
+  nextResponse = {error: 'interaction_required'};
+  await assert.rejects(
+    () => reauthGoogleAccessToken({loadGis: async () => fakeOAuth2}),
+    err => err instanceof UnauthorizedDriveError && err.message === 'Sign in again'
+  );
+  assert.equal(getAccessToken(), null);
+  clearAccessToken();
+});
+
+test('GIS token errors produce clear user-facing error messages', async () => {
+  resetGisLoader();
+  clearAccessToken();
+
+  const runWithOutcome = outcome =>
+    requestGoogleAccessToken({
+      loadGis: async () => ({
+        initTokenClient(config) {
+          return {
+            requestAccessToken() {
+              if (outcome.viaErrorCallback) {
+                config.error_callback(outcome.payload);
+              } else {
+                config.callback(outcome.payload);
+              }
+            }
+          };
+        }
+      })
+    });
+
+  await assert.rejects(
+    () => runWithOutcome({payload: {error: 'access_denied'}}),
+    {message: 'Google sign-in was cancelled.'}
+  );
+  assert.equal(getAccessToken(), null);
+
+  await assert.rejects(
+    () => runWithOutcome({payload: {}}),
+    {message: 'Google did not return an access token.'}
+  );
+  assert.equal(getAccessToken(), null);
+
+  await assert.rejects(
+    () => runWithOutcome({viaErrorCallback: true, payload: {type: 'popup_closed'}}),
+    {message: 'Google sign-in was closed before completing.'}
+  );
+
+  await assert.rejects(
+    () => runWithOutcome({viaErrorCallback: true, payload: {type: 'popup_failed_to_open'}}),
+    {message: 'Popup blocked. Allow popups for this site and try again.'}
+  );
+  clearAccessToken();
+});
+
+test('GIS load failure produces a clear error and clears cached promise for retry', async () => {
+  resetGisLoader();
+  clearAccessToken();
+  const {doc, appended} = createFakeDom();
+  const win = {};
+
+  const failedLoad = requestGoogleAccessToken({doc, win});
+  assert.equal(appended.length, 1);
+  appended[0].onerror(new Error('network error'));
+
+  await assert.rejects(() => failedLoad, {message: GIS_LOAD_ERROR});
+  assert.equal(appended[0].removed, true);
+  assert.equal(getAccessToken(), null);
+
+  // A subsequent retry can inject a fresh script and succeed
+  const retryLoad = loadGisScript({doc, win});
+  assert.equal(appended.length, 2);
+  const fakeOAuth2 = {initTokenClient: () => ({requestAccessToken: () => {}})};
+  win.google = {accounts: {oauth2: fakeOAuth2}};
+  appended[1].onload();
+  assert.equal(await retryLoad, fakeOAuth2);
+  resetGisLoader();
 });
